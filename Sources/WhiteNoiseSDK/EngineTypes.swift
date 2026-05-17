@@ -2,7 +2,7 @@
 //  EngineTypes.swift
 //  WhiteNoiseSDK
 //
-
+import Foundation
 // MARK: - EngineState
 
 /// 引擎播放状态
