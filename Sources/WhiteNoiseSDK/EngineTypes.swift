@@ -17,6 +17,34 @@ public enum EngineState: Equatable {
     case paused
 }
 
+// MARK: - TrackSnapshot
+
+/// 面向 UI 的轻量轨道快照。
+///
+/// 该模型不持有 `AVAudioPlayerNode` 等实时音频对象，适合 SwiftUI 列表、
+/// Slider 和状态展示订阅。
+public struct TrackSnapshot: Identifiable, Equatable, Sendable {
+    public let id: String
+    public let displayName: String
+    public let artworkName: String?
+    public let volume: Float
+    public let isPlaying: Bool
+
+    public init(
+        id: String,
+        displayName: String,
+        artworkName: String? = nil,
+        volume: Float,
+        isPlaying: Bool
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.artworkName = artworkName
+        self.volume = volume
+        self.isPlaying = isPlaying
+    }
+}
+
 // MARK: - EngineError
 
 /// 引擎错误

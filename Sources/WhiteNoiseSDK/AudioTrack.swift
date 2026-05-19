@@ -26,15 +26,15 @@ public final class AudioTrack: Identifiable, ObservableObject {
     /// 封面图片资源名称（Assets 中的名称）
     public let artworkName: String?
 
-    // 内部持有，SDK 外部不可直接操作播放节点
-    internal let player: AVAudioPlayerNode
+    // 仅为兼容内部旧测试/初始化路径保留；实时播放节点不应通过 UI 对象访问。
+    internal let player: AVAudioPlayerNode?
 
     /// 当前音量（主线程只读，由引擎通过 `applyUIVolume` 更新）
     @MainActor @Published public private(set) var volume: Float
 
     internal init(
         id: String,
-        player: AVAudioPlayerNode,
+        player: AVAudioPlayerNode? = nil,
         volume: Float = 1.0,
         displayName: String? = nil,
         artworkName: String? = nil
@@ -44,7 +44,6 @@ public final class AudioTrack: Identifiable, ObservableObject {
         self.artworkName = artworkName
         self.player      = player
         self._volume     = Published(initialValue: volume)
-        player.volume    = volume
     }
 
     /// 由 `WhiteNoiseEngine` 在淡变过程中调用，更新 UI 音量值

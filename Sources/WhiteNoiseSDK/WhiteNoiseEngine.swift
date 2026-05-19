@@ -59,12 +59,20 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
     /// 当前所有播放轨道，key 为轨道 ID
     @MainActor @Published public private(set) var tracks: [String: AudioTrack] = [:] {
-        didSet { _updateNowPlayingIfNeeded() }
+        didSet { scheduleNowPlayingUpdate() }
+    }
+
+    /// 面向 SwiftUI 的轻量状态快照，不包含任何实时音频节点。
+    @MainActor @Published public private(set) var trackSnapshots: [TrackSnapshot] = [] {
+        didSet { scheduleNowPlayingUpdate() }
     }
 
     /// 引擎当前状态
     @MainActor @Published public private(set) var state: EngineState = .idle {
-        didSet { _updateNowPlayingIfNeeded() }
+        didSet {
+            updateSnapshotPlaybackState()
+            scheduleNowPlayingUpdate()
+        }
     }
 
     /// 引擎配置（只读）
@@ -85,10 +93,13 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         label: "com.whitenoiseSDK.audioQueue",
         qos: .userInitiated
     )
+    private let audioQueueSpecificKey = DispatchSpecificKey<UInt8>()
 
     // MARK: - Fade（只在 audioQueue 访问）
 
-    private var fadeTasks: [String: Task<Void, Never>] = [:]
+    private var fadeTimers: [String: DispatchSourceTimer] = [:]
+    private var uiVolumeTimers: [String: DispatchSourceTimer] = [:]
+    private var pendingUIVolumes: [String: Float] = [:]
 
     // MARK: - 业务依赖
 
@@ -96,6 +107,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     private let loader:  NetworkLoader
     private let session: AudioSessionManager
     private var nowPlaying: NowPlayingManager?
+    @MainActor private var nowPlayingUpdateTask: Task<Void, Never>?
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -118,6 +130,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             self.nowPlaying = NowPlayingManager(artistName: configuration.artistName)
         }
 
+        audioQueue.setSpecific(key: audioQueueSpecificKey, value: 1)
         session.configure()
         observeInterruptions()
         observeRouteChanges()
@@ -128,7 +141,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         // 问题⑥修复：原 deinit 只调用 cancellables.removeAll()，
         // 遗漏了以下两类资源：
         //
-        // a) fadeTasks：Task 对象在 deinit 后仍在后台运行，
+        // a) fadeTimers：DispatchSourceTimer 在 deinit 后仍在后台运行，
         //    持有 players 字典的强引用，延迟 AVAudioPlayerNode 的释放。
         //
         // b) players / engine：AVAudioEngine 被操作系统音频子系统持有，
@@ -138,12 +151,23 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         // 注意：deinit 不可 await，所以 audioQueue 用 sync 确保立即清理完毕。
         cancellables.removeAll()
         nowPlaying?.tearDownRemoteCommands()
+        nowPlayingUpdateTask?.cancel()
 
-        // 在 audioQueue 上同步清理，保证 deinit 返回前资源已释放
-        audioQueue.sync { [self] in
-            fadeTasks.values.forEach { $0.cancel() }
-            fadeTasks.removeAll()
+        let cleanup = { [self] in
+            fadeTimers.values.forEach { $0.cancel() }
+            fadeTimers.removeAll()
+            uiVolumeTimers.values.forEach { $0.cancel() }
+            uiVolumeTimers.removeAll()
+            pendingUIVolumes.removeAll()
             resetEngine()
+        }
+
+        // 在 audioQueue 上同步清理，保证 deinit 返回前资源已释放。
+        // 若最后一次强引用恰好在 audioQueue 闭包尾部释放，直接执行以避免 sync 自锁。
+        if DispatchQueue.getSpecific(key: audioQueueSpecificKey) != nil {
+            cleanup()
+        } else {
+            audioQueue.sync(execute: cleanup)
         }
     }
 
@@ -198,6 +222,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         Task { @MainActor in
             guard tracks[id] != nil else { return }
             tracks.removeValue(forKey: id)
+            trackSnapshots.removeAll { $0.id == id }
             if tracks.isEmpty {
                 state = .idle
                 lastPlayingSoundName = nil
@@ -207,15 +232,8 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
         audioQueue.async { [weak self] in
             guard let self, self.players[id] != nil else { return }
-            self.cancelFade(id: id)
-            self.fadeTasks[id] = Task { [weak self] in
-                guard let self else { return }
-                await self.runFade(id: id, to: 0, duration: fadeDuration)
-                self.audioQueue.async { [weak self] in
-                    guard let self else { return }
-                    self.detachPlayer(id: id)
-                    self.fadeTasks.removeValue(forKey: id)
-                }
+            self.startFade(id: id, to: 0, duration: fadeDuration) { [weak self] in
+                self?.detachPlayer(id: id)
             }
         }
     }
@@ -228,14 +246,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     public func setVolume(_ volume: Float, for id: String, fade: TimeInterval = 0.3) {
         audioQueue.async { [weak self] in
             guard let self, self.players[id] != nil else { return }
-            self.cancelFade(id: id)
-            self.fadeTasks[id] = Task { [weak self] in
-                guard let self else { return }
-                await self.runFade(id: id, to: volume, duration: fade)
-                self.audioQueue.async { [weak self] in
-                    self?.fadeTasks.removeValue(forKey: id)
-                }
-            }
+            self.startFade(id: id, to: volume, duration: fade)
         }
     }
 
@@ -319,6 +330,12 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
                         }
                         do {
                             self.cancelFade(id: id)
+                            guard self.players[id] != nil
+                                    || self.players.count < self.configuration.maxConcurrentTracks else {
+                                throw EngineError.tooManyTracks(
+                                    limit: self.configuration.maxConcurrentTracks
+                                )
+                            }
                             self.attachPlayer(id: id, audioFile: audioFile, volume: volume)
                             try self.startEngineIfNeeded()
                             self.players[id]?.play()
@@ -334,10 +351,26 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         }
 
         await MainActor.run { [weak self] in
-            guard let self, let player = self.players[id] else { return }
-            let track = AudioTrack(id: id, player: player, volume: volume,
-                                   displayName: name, artworkName: id)
+            guard let self else { return }
+            let clampedVolume = max(0, min(1, volume))
+            let displayName = name ?? id
+            let track = AudioTrack(
+                id: id,
+                player: nil,
+                volume: clampedVolume,
+                displayName: displayName,
+                artworkName: id
+            )
             self.tracks[id] = track
+            self.upsertTrackSnapshot(
+                TrackSnapshot(
+                    id: id,
+                    displayName: displayName,
+                    artworkName: id,
+                    volume: clampedVolume,
+                    isPlaying: true
+                )
+            )
             self.state = .playing
         }
     }
@@ -360,10 +393,21 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
-    private func _updateNowPlayingIfNeeded() {
+    private func scheduleNowPlayingUpdate() {
+        guard configuration.nowPlayingEnabled, nowPlaying != nil else { return }
+        nowPlayingUpdateTask?.cancel()
+        nowPlayingUpdateTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            self?.updateNowPlayingIfNeeded()
+        }
+    }
+
+    @MainActor
+    private func updateNowPlayingIfNeeded() {
         guard configuration.nowPlayingEnabled, let nowPlaying else { return }
 
-        guard !tracks.isEmpty else {
+        guard !trackSnapshots.isEmpty else {
             nowPlaying.clearNowPlaying()
             return
         }
@@ -371,16 +415,16 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         let title: String
         if let mixName = currentMixName {
             title = mixName
-        } else if tracks.count == 1 {
-            title = tracks.values.first?.displayName ?? lastPlayingSoundName ?? "White Noise"
+        } else if trackSnapshots.count == 1 {
+            title = trackSnapshots.first?.displayName ?? lastPlayingSoundName ?? "White Noise"
         } else {
-            title = tracks.values
+            title = trackSnapshots
                 .sorted { $0.displayName < $1.displayName }
                 .map(\.displayName)
                 .joined(separator: "、")
         }
 
-        let artworkName = tracks.values
+        let artworkName = trackSnapshots
             .sorted { $0.displayName < $1.displayName }
             .compactMap(\.artworkName)
             .first
@@ -406,24 +450,44 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     }
 
     private func scheduleLoop(player: AVAudioPlayerNode, audioFile: AVAudioFile, id: String) {
-        // 问题②修复：原闭包强持有 audioFile —— detachPlayer 将其从字典移除后，
-        // 文件对象仍被闭包 retain，直到下一次回调触发才真正释放（数秒后）。
-        // 改用 [weak audioFile]：一旦字典移除，引用计数立即归零可释放；
-        // guard let audioFile 确保若已释放就不再重新调度。
-        audioFile.framePosition = 0
-        player.scheduleFile(audioFile, at: nil, completionCallbackType: .dataConsumed) { [weak self, weak audioFile] _ in
-            self?.audioQueue.async { [weak self, weak audioFile] in
+        // 预排两段：当前段被 render pipeline 消费后，立即在 audioQueue 上补排一段。
+        // 这样队列里始终尽量保留下一段音频，UI 主线程繁忙时也不依赖即时回调续播。
+        scheduleNextLoopSegment(player: player, audioFile: audioFile, id: id)
+        scheduleNextLoopSegment(player: player, audioFile: audioFile, id: id)
+    }
+
+    private func scheduleNextLoopSegment(
+        player: AVAudioPlayerNode,
+        audioFile: AVAudioFile,
+        id: String
+    ) {
+        let frameCount = AVAudioFrameCount(
+            min(audioFile.length, AVAudioFramePosition(AVAudioFrameCount.max))
+        )
+        guard frameCount > 0 else { return }
+
+        player.scheduleSegment(
+            audioFile,
+            startingFrame: 0,
+            frameCount: frameCount,
+            at: nil,
+            completionCallbackType: .dataConsumed
+        ) { [weak self, weak audioFile, weak player] _ in
+            self?.audioQueue.async { [weak self, weak audioFile, weak player] in
                 guard let self,
                       let audioFile,
-                      self.players[id] === player,
-                      player.isPlaying else { return }
-                self.scheduleLoop(player: player, audioFile: audioFile, id: id)
+                      let player,
+                      self.players[id] === player else { return }
+                self.scheduleNextLoopSegment(player: player, audioFile: audioFile, id: id)
             }
         }
     }
 
     private func detachPlayer(id: String) {
         cancelFade(id: id)
+        uiVolumeTimers[id]?.cancel()
+        uiVolumeTimers.removeValue(forKey: id)
+        pendingUIVolumes.removeValue(forKey: id)
         guard let player = players[id] else { return }
         audioFiles.removeValue(forKey: id)
         player.stop()
@@ -452,6 +516,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     private func stopAll(clearNames: Bool) {
         Task { @MainActor in
             tracks.removeAll()
+            trackSnapshots.removeAll()
             state = .idle
             if clearNames {
                 lastPlayingSoundName = nil
@@ -460,16 +525,11 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         }
         audioQueue.async { [weak self] in
             guard let self else { return }
-            // 问题④修复：cancel() 仅设置 Task.isCancelled 标志，不会中断已经
-            // dispatch 到 audioQueue 的尾部闭包（runFade 完成后的 detachPlayer 调度）。
-            // 这些尾部闭包仍持有 players / engine，在 resetEngine() 之后再执行
-            // 会访问已被清空的集合，造成状态不一致，且延迟引擎对象的释放。
-            //
-            // 解决方案：先 cancel 所有 Task，再同步清空 fadeTasks 字典，
-            // 最后 barrier async 保证之前 dispatch 的所有尾部闭包都已完成后
-            // 再执行 resetEngine。
-            self.fadeTasks.values.forEach { $0.cancel() }
-            self.fadeTasks.removeAll()
+            self.fadeTimers.values.forEach { $0.cancel() }
+            self.fadeTimers.removeAll()
+            self.uiVolumeTimers.values.forEach { $0.cancel() }
+            self.uiVolumeTimers.removeAll()
+            self.pendingUIVolumes.removeAll()
             self.resetEngine()
         }
     }
@@ -477,37 +537,69 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     // MARK: - Fade（在 audioQueue 发起）
 
     private func cancelFade(id: String) {
-        fadeTasks[id]?.cancel()
-        fadeTasks.removeValue(forKey: id)
+        fadeTimers[id]?.cancel()
+        fadeTimers.removeValue(forKey: id)
     }
 
-    private func runFade(id: String, to target: Float, duration: TimeInterval) async {
+    private func startFade(
+        id: String,
+        to target: Float,
+        duration: TimeInterval,
+        completion: (() -> Void)? = nil
+    ) {
         guard let player = players[id] else { return }
+        cancelFade(id: id)
 
         let startVolume   = player.volume
         let clampedTarget = max(0, min(1, target))
 
         guard duration > 0, abs(startVolume - clampedTarget) > 0.0001 else {
             player.volume = clampedTarget
-            await MainActor.run { [weak self] in self?.tracks[id]?.applyUIVolume(clampedTarget) }
+            syncUIVolume(id: id, volume: clampedTarget)
+            completion?()
             return
         }
 
         let startDB  = 20 * log10(max(0.0001, startVolume))
         let targetDB = 20 * log10(max(0.0001, clampedTarget))
-        let steps    = max(30, Int(duration * 60))
-        let interval = UInt64(duration / Double(steps) * 1_000_000_000)
+        let steps    = max(2, Int(duration * 60))
+        let interval = duration / Double(steps)
+        let uiStride = max(1, Int(ceil(0.1 / interval)))
+        var step = 0
 
-        for step in 1 ... steps {
-            guard !Task.isCancelled else { return }
+        let timer = DispatchSource.makeTimerSource(queue: audioQueue)
+        fadeTimers[id] = timer
+
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.fadeTimers[id] === timer, self.players[id] === player else {
+                timer.cancel()
+                return
+            }
+
+            step += 1
             let t          = Float(step) / Float(steps)
             let currentDB  = startDB + (targetDB - startDB) * t
             let newVolume  = (step == steps) ? clampedTarget : pow(10, currentDB / 20)
             player.volume  = newVolume
-            let v = newVolume
-            await MainActor.run { [weak self] in self?.tracks[id]?.applyUIVolume(v) }
-            if step < steps { try? await Task.sleep(nanoseconds: interval) }
+
+            if step == steps || step.isMultiple(of: uiStride) {
+                self.syncUIVolume(id: id, volume: newVolume, force: step == steps)
+            }
+
+            if step >= steps {
+                self.fadeTimers.removeValue(forKey: id)
+                timer.cancel()
+                completion?()
+            }
         }
+
+        timer.schedule(
+            deadline: .now() + interval,
+            repeating: interval,
+            leeway: .milliseconds(5)
+        )
+        timer.resume()
     }
 
     // MARK: - 主线程状态工具
@@ -515,6 +607,72 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     @MainActor
     private func setStateOnMain(_ newState: EngineState) {
         state = newState
+    }
+
+    @MainActor
+    private func upsertTrackSnapshot(_ snapshot: TrackSnapshot) {
+        if let index = trackSnapshots.firstIndex(where: { $0.id == snapshot.id }) {
+            trackSnapshots[index] = snapshot
+        } else {
+            trackSnapshots.append(snapshot)
+        }
+    }
+
+    @MainActor
+    private func updateSnapshotPlaybackState() {
+        let isPlaying = state == .playing
+        trackSnapshots = trackSnapshots.map {
+            TrackSnapshot(
+                id: $0.id,
+                displayName: $0.displayName,
+                artworkName: $0.artworkName,
+                volume: $0.volume,
+                isPlaying: isPlaying
+            )
+        }
+    }
+
+    private func syncUIVolume(id: String, volume: Float, force: Bool = false) {
+        pendingUIVolumes[id] = volume
+
+        if force {
+            flushUIVolume(id: id)
+            return
+        }
+
+        guard uiVolumeTimers[id] == nil else { return }
+
+        let timer = DispatchSource.makeTimerSource(queue: audioQueue)
+        uiVolumeTimers[id] = timer
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.uiVolumeTimers.removeValue(forKey: id)
+            timer.cancel()
+            self.flushUIVolume(id: id)
+        }
+        timer.schedule(deadline: .now() + 0.1, leeway: .milliseconds(10))
+        timer.resume()
+    }
+
+    private func flushUIVolume(id: String) {
+        uiVolumeTimers[id]?.cancel()
+        uiVolumeTimers.removeValue(forKey: id)
+        guard let volume = pendingUIVolumes.removeValue(forKey: id) else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            tracks[id]?.applyUIVolume(volume)
+
+            guard let index = trackSnapshots.firstIndex(where: { $0.id == id }) else { return }
+            let snapshot = trackSnapshots[index]
+            trackSnapshots[index] = TrackSnapshot(
+                id: snapshot.id,
+                displayName: snapshot.displayName,
+                artworkName: snapshot.artworkName,
+                volume: volume,
+                isPlaying: snapshot.isPlaying
+            )
+        }
     }
 
     // MARK: - 系统通知

@@ -17,6 +17,10 @@ final class NowPlayingManager {
     private let nowPlayingInfoCenter = MPNowPlayingInfoCenter.default()
     private let remoteCommandCenter  = MPRemoteCommandCenter.shared()
     private let artistName: String
+    private let updateQueue = DispatchQueue(
+        label: "com.whitenoiseSDK.nowPlayingQueue",
+        qos: .utility
+    )
 
     init(artistName: String) {
         self.artistName = artistName
@@ -84,28 +88,33 @@ final class NowPlayingManager {
     // MARK: - Now Playing Info
 
     func updateNowPlaying(title: String, isPlaying: Bool, artworkName: String? = nil) {
-        var info = [String: Any]()
-        info[MPMediaItemPropertyTitle]                    = title
-        info[MPMediaItemPropertyArtist]                   = artistName
-        info[MPNowPlayingInfoPropertyIsLiveStream]        = true
-        info[MPNowPlayingInfoPropertyMediaType]           = MPNowPlayingInfoMediaType.audio.rawValue
-        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
-        info[MPNowPlayingInfoPropertyPlaybackRate]        = isPlaying ? 1.0 : 0.0
+        updateQueue.async { [weak self] in
+            guard let self else { return }
+            var info = [String: Any]()
+            info[MPMediaItemPropertyTitle]                    = title
+            info[MPMediaItemPropertyArtist]                   = artistName
+            info[MPNowPlayingInfoPropertyIsLiveStream]        = true
+            info[MPNowPlayingInfoPropertyMediaType]           = MPNowPlayingInfoMediaType.audio.rawValue
+            info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+            info[MPNowPlayingInfoPropertyPlaybackRate]        = isPlaying ? 1.0 : 0.0
 
-        if let image = artworkImage(named: artworkName) {
+            if let image = artworkImage(named: artworkName) {
 #if canImport(UIKit)
-            let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-            info[MPMediaItemPropertyArtwork] = artwork
+                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                info[MPMediaItemPropertyArtwork] = artwork
 #endif
-        }
+            }
 
-        nowPlayingInfoCenter.nowPlayingInfo  = info
-        nowPlayingInfoCenter.playbackState   = isPlaying ? .playing : .paused
+            nowPlayingInfoCenter.nowPlayingInfo  = info
+            nowPlayingInfoCenter.playbackState   = isPlaying ? .playing : .paused
+        }
     }
 
     func clearNowPlaying() {
-        nowPlayingInfoCenter.nowPlayingInfo = nil
-        nowPlayingInfoCenter.playbackState  = .stopped
+        updateQueue.async { [weak self] in
+            self?.nowPlayingInfoCenter.nowPlayingInfo = nil
+            self?.nowPlayingInfoCenter.playbackState  = .stopped
+        }
     }
 
     // MARK: - Artwork Generation
