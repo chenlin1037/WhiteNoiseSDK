@@ -76,6 +76,8 @@ final class NowPlayingManager {
             toggleHandler()
             return .success
         }
+
+        updateCommandAvailability(hasActiveItem: false, isPlaying: false)
     }
 
     /// 在引擎 deinit 时调用，从系统单例中移除所有 target，切断强引用链
@@ -105,15 +107,35 @@ final class NowPlayingManager {
 #endif
             }
 
-            nowPlayingInfoCenter.nowPlayingInfo  = info
-            nowPlayingInfoCenter.playbackState   = isPlaying ? .playing : .paused
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.nowPlayingInfoCenter.nowPlayingInfo = info
+                self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
+                self.updateCommandAvailability(hasActiveItem: true, isPlaying: isPlaying)
+            }
         }
     }
 
     func clearNowPlaying() {
-        updateQueue.async { [weak self] in
+        DispatchQueue.main.async { [weak self] in
             self?.nowPlayingInfoCenter.nowPlayingInfo = nil
             self?.nowPlayingInfoCenter.playbackState  = .stopped
+            self?.updateCommandAvailability(hasActiveItem: false, isPlaying: false)
+        }
+    }
+
+    private func updateCommandAvailability(hasActiveItem: Bool, isPlaying: Bool) {
+        let update = { [weak self] in
+            guard let self else { return }
+            self.remoteCommandCenter.playCommand.isEnabled = hasActiveItem && !isPlaying
+            self.remoteCommandCenter.pauseCommand.isEnabled = hasActiveItem && isPlaying
+            self.remoteCommandCenter.togglePlayPauseCommand.isEnabled = hasActiveItem
+        }
+
+        if Thread.isMainThread {
+            update()
+        } else {
+            DispatchQueue.main.async(execute: update)
         }
     }
 

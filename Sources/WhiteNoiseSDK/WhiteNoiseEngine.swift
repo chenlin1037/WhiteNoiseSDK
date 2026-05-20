@@ -429,7 +429,10 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             .compactMap(\.artworkName)
             .first
 
-        nowPlaying.updateNowPlaying(title: title, isPlaying: state == .playing, artworkName: artworkName)
+        let isPlaying = state == .playing
+            || (state == .loading && trackSnapshots.contains { $0.isPlaying })
+
+        nowPlaying.updateNowPlaying(title: title, isPlaying: isPlaying, artworkName: artworkName)
     }
 
     // MARK: - 音频硬件私有方法（只在 audioQueue 调用）

@@ -27,7 +27,7 @@
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/chenlin1037/WhiteNoiseSDK.git", from: "1.0.0")
+    .package(url: "https://github.com/chenlin1037/WhiteNoiseSDK.git", from: "1.0.3")
 ]
 ```
 
