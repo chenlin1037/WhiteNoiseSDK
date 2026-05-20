@@ -71,6 +71,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     @MainActor @Published public private(set) var state: EngineState = .idle {
         didSet {
             updateSnapshotPlaybackState()
+            updateNowPlayingPlaybackStateIfNeeded()
             scheduleNowPlayingUpdate()
         }
     }
@@ -306,7 +307,11 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             throw EngineError.tooManyTracks(limit: configuration.maxConcurrentTracks)
         }
 
-        await MainActor.run { state = .loading }
+        await MainActor.run {
+            if state != .playing {
+                state = .loading
+            }
+        }
 
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             // 问题③修复：原代码在 Task.detached 内的 audioQueue.async 闭包中
@@ -386,7 +391,11 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
                 guard let self else { return }
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    if self.state == .playing { self.pauseAll() } else { self.resumeAll() }
+                    if self.effectiveNowPlayingIsPlaying {
+                        self.pauseAll()
+                    } else {
+                        self.resumeAll()
+                    }
                 }
             }
         )
@@ -429,10 +438,11 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             .compactMap(\.artworkName)
             .first
 
-        let isPlaying = state == .playing
-            || (state == .loading && trackSnapshots.contains { $0.isPlaying })
-
-        nowPlaying.updateNowPlaying(title: title, isPlaying: isPlaying, artworkName: artworkName)
+        nowPlaying.updateNowPlaying(
+            title: title,
+            isPlaying: effectiveNowPlayingIsPlaying,
+            artworkName: artworkName
+        )
     }
 
     // MARK: - 音频硬件私有方法（只在 audioQueue 调用）
@@ -613,6 +623,20 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     }
 
     @MainActor
+    private var effectiveNowPlayingIsPlaying: Bool {
+        state == .playing || (state == .loading && trackSnapshots.contains { $0.isPlaying })
+    }
+
+    @MainActor
+    private func updateNowPlayingPlaybackStateIfNeeded() {
+        guard configuration.nowPlayingEnabled,
+              let nowPlaying,
+              !trackSnapshots.isEmpty,
+              state == .playing || state == .paused || state == .loading else { return }
+        nowPlaying.updatePlaybackState(isPlaying: effectiveNowPlayingIsPlaying)
+    }
+
+    @MainActor
     private func upsertTrackSnapshot(_ snapshot: TrackSnapshot) {
         if let index = trackSnapshots.firstIndex(where: { $0.id == snapshot.id }) {
             trackSnapshots[index] = snapshot
@@ -623,6 +647,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
     @MainActor
     private func updateSnapshotPlaybackState() {
+        guard state == .playing || state == .paused else { return }
         let isPlaying = state == .playing
         trackSnapshots = trackSnapshots.map {
             TrackSnapshot(

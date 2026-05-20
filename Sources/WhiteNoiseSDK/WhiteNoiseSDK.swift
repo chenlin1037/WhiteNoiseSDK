@@ -6,7 +6,7 @@
 //
 
 /// SDK 版本
-public let WhiteNoiseSDKVersion = "1.0.4"
+public let WhiteNoiseSDKVersion = "1.0.5"
 
 // 通过 typealiases 让宿主无需了解内部模块结构
 public typealias WNEngine        = WhiteNoiseEngine

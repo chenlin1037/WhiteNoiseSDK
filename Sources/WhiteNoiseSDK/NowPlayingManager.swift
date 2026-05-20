@@ -21,6 +21,7 @@ final class NowPlayingManager {
         label: "com.whitenoiseSDK.nowPlayingQueue",
         qos: .utility
     )
+    private var updateRevision = 0
 
     init(artistName: String) {
         self.artistName = artistName
@@ -77,7 +78,7 @@ final class NowPlayingManager {
             return .success
         }
 
-        updateCommandAvailability(hasActiveItem: false, isPlaying: false)
+        updateCommandAvailability(hasActiveItem: false)
     }
 
     /// 在引擎 deinit 时调用，从系统单例中移除所有 target，切断强引用链
@@ -90,45 +91,68 @@ final class NowPlayingManager {
     // MARK: - Now Playing Info
 
     func updateNowPlaying(title: String, isPlaying: Bool, artworkName: String? = nil) {
-        updateQueue.async { [weak self] in
+        DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            var info = [String: Any]()
-            info[MPMediaItemPropertyTitle]                    = title
-            info[MPMediaItemPropertyArtist]                   = artistName
-            info[MPNowPlayingInfoPropertyIsLiveStream]        = true
-            info[MPNowPlayingInfoPropertyMediaType]           = MPNowPlayingInfoMediaType.audio.rawValue
-            info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
-            info[MPNowPlayingInfoPropertyPlaybackRate]        = isPlaying ? 1.0 : 0.0
+            let revision = self.nextUpdateRevision()
 
-            if let image = artworkImage(named: artworkName) {
-#if canImport(UIKit)
-                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                info[MPMediaItemPropertyArtwork] = artwork
-#endif
-            }
-
-            DispatchQueue.main.async { [weak self] in
+            self.updateQueue.async { [weak self] in
                 guard let self else { return }
-                self.nowPlayingInfoCenter.nowPlayingInfo = info
-                self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
-                self.updateCommandAvailability(hasActiveItem: true, isPlaying: isPlaying)
+                var info = [String: Any]()
+                info[MPMediaItemPropertyTitle]                    = title
+                info[MPMediaItemPropertyArtist]                   = artistName
+                info[MPNowPlayingInfoPropertyIsLiveStream]        = true
+                info[MPNowPlayingInfoPropertyMediaType]           = MPNowPlayingInfoMediaType.audio.rawValue
+                info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+                info[MPNowPlayingInfoPropertyPlaybackRate]        = isPlaying ? 1.0 : 0.0
+
+                if let image = artworkImage(named: artworkName) {
+#if canImport(UIKit)
+                    let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                    info[MPMediaItemPropertyArtwork] = artwork
+#endif
+                }
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, revision == self.updateRevision else { return }
+                    self.nowPlayingInfoCenter.nowPlayingInfo = info
+                    self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
+                    self.updateCommandAvailability(hasActiveItem: true)
+                }
             }
+        }
+    }
+
+    func updatePlaybackState(isPlaying: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.updateRevision += 1
+            guard var info = self.nowPlayingInfoCenter.nowPlayingInfo else { return }
+            info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+            self.nowPlayingInfoCenter.nowPlayingInfo = info
+            self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
+            self.updateCommandAvailability(hasActiveItem: true)
         }
     }
 
     func clearNowPlaying() {
         DispatchQueue.main.async { [weak self] in
+            self?.updateRevision += 1
             self?.nowPlayingInfoCenter.nowPlayingInfo = nil
             self?.nowPlayingInfoCenter.playbackState  = .stopped
-            self?.updateCommandAvailability(hasActiveItem: false, isPlaying: false)
+            self?.updateCommandAvailability(hasActiveItem: false)
         }
     }
 
-    private func updateCommandAvailability(hasActiveItem: Bool, isPlaying: Bool) {
+    private func nextUpdateRevision() -> Int {
+        updateRevision += 1
+        return updateRevision
+    }
+
+    private func updateCommandAvailability(hasActiveItem: Bool) {
         let update = { [weak self] in
             guard let self else { return }
-            self.remoteCommandCenter.playCommand.isEnabled = hasActiveItem && !isPlaying
-            self.remoteCommandCenter.pauseCommand.isEnabled = hasActiveItem && isPlaying
+            self.remoteCommandCenter.playCommand.isEnabled = hasActiveItem
+            self.remoteCommandCenter.pauseCommand.isEnabled = hasActiveItem
             self.remoteCommandCenter.togglePlayPauseCommand.isEnabled = hasActiveItem
         }
 
