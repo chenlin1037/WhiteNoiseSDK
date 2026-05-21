@@ -8,7 +8,7 @@ import Foundation
 //
 
 /// SDK 版本
-public let WhiteNoiseSDKVersion = "1.0.6"
+public let WhiteNoiseSDKVersion = "1.0.7"
 
 // ⚠️ 修复：添加统一的日志系统
 /// 日志级别
