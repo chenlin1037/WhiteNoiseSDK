@@ -327,8 +327,19 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             self.stateLock.lock()
             defer { self.stateLock.unlock() }
             
+            // ⚠️ 修复：先更新所有 player 的暂停状态
             self.players.values.forEach { $0.pause() }
-            Task { await self.setStateOnMain(.paused) }
+            
+            // ⚠️ 关键修复：立即在主线程更新状态和 Now Playing
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.state = .paused
+                
+                // 立即更新 Now Playing 的播放状态
+                if self.configuration.nowPlayingEnabled, let nowPlaying = self.nowPlaying {
+                    nowPlaying.updatePlaybackState(isPlaying: false)
+                }
+            }
         }
     }
 
@@ -340,8 +351,20 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
                 try self.startEngineIfNeeded()
                 self.stateLock.lock()
                 defer { self.stateLock.unlock() }
+                
+                // ⚠️ 修复：先更新所有 player 的播放状态
                 self.players.values.forEach { $0.play() }
-                Task { await self.setStateOnMain(.playing) }
+                
+                // ⚠️ 关键修复：立即在主线程更新状态和 Now Playing
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.state = .playing
+                    
+                    // 立即更新 Now Playing 的播放状态
+                    if self.configuration.nowPlayingEnabled, let nowPlaying = self.nowPlaying {
+                        nowPlaying.updatePlaybackState(isPlaying: true)
+                    }
+                }
             } catch {
                 wn_log(.error, "resumeAll 失败: \(error)")
             }

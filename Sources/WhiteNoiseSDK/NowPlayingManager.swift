@@ -108,6 +108,23 @@ final class NowPlayingManager {
         nowPlayingInfoCenter.playbackState  = .stopped
     }
 
+    func updatePlaybackState(isPlaying: Bool) {
+        // ⚠️ 修复：立即同步更新播放状态
+        // 确保应用内、锁屏和控制中心三者状态完全一致
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            
+            // 直接更新 playbackState
+            self.nowPlayingInfoCenter.playbackState = isPlaying ? .playing : .paused
+            
+            // 同时更新 playbackRate，这对锁屏控制很重要
+            if var info = self.nowPlayingInfoCenter.nowPlayingInfo {
+                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+                self.nowPlayingInfoCenter.nowPlayingInfo = info
+            }
+        }
+    }
+
     // MARK: - Artwork Generation
 
 #if canImport(UIKit)

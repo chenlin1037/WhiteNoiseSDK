@@ -32,6 +32,9 @@ public final class AudioTrack: Identifiable, ObservableObject {
     /// 当前音量（主线程只读，由引擎通过 `applyUIVolume` 更新）
     @MainActor @Published public private(set) var volume: Float
 
+    /// ⚠️ 新增：播放状态，与应用内、锁屏和控制中心同步
+    @MainActor @Published public private(set) var isPlaying: Bool
+
     internal init(
         id: String,
         player: AVAudioPlayerNode,
@@ -44,6 +47,7 @@ public final class AudioTrack: Identifiable, ObservableObject {
         self.artworkName = artworkName
         self.player      = player
         self._volume     = Published(initialValue: volume)
+        self._isPlaying  = Published(initialValue: true)
         player.volume    = volume
     }
 
@@ -51,5 +55,11 @@ public final class AudioTrack: Identifiable, ObservableObject {
     @MainActor
     internal func applyUIVolume(_ value: Float) {
         volume = value
+    }
+
+    /// ⚠️ 新增：由引擎调用，同步播放状态
+    @MainActor
+    internal func updatePlaybackState(_ playing: Bool) {
+        isPlaying = playing
     }
 }
