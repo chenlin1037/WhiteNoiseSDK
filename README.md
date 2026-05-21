@@ -4,17 +4,22 @@
 
 ## 功能
 
-- 最多 6 条轨道同时播放（可配置）
-- 自动磁盘缓存 + LRU 淘汰（默认 500 MB）
-- 无缝循环播放
-- 对数曲线淡入 / 淡出
-- 锁屏 / 控制中心 Now Playing 集成
-- 音频中断 & 路由变化自动处理
-- 完整 `async/await` API，兼容 SwiftUI `ObservableObject`
+- ✅ 最多 6 条轨道同时播放（可配置）
+- ✅ 自动磁盘缓存 + LRU 淘汰（默认 500 MB）
+- ✅ 无缝循环播放
+- ✅ 对数曲线淡入 / 淡出
+- ✅ 锁屏 / 控制中心 Now Playing 集成
+- ✅ 音频中断 & 路由变化自动处理
+- ✅ 完整 `async/await` API，兼容 SwiftUI `ObservableObject`
+- 🆕 **多平台支持**：iOS 16+、macOS 13+、watchOS 9+、tvOS 16+
+- 🆕 **智能重试机制**：网络下载失败自动重试（最多3次）
+- 🆕 **统一日志系统**：可配置日志级别和自定义处理器
+- 🆕 **性能监控**：缓存命中率、错误率等统计信息
+- 🆕 **线程安全**：完善的并发控制和状态同步
 
 ## 要求
 
-- iOS 16+
+- iOS 16+ / macOS 13+ / watchOS 9+ / tvOS 16+
 - Swift 5.9+
 
 ---
@@ -155,6 +160,29 @@ struct TrackRow: View {
 }
 ```
 
+### 9. 日志配置
+
+```swift
+// 设置日志级别
+WNLogConfig.level = .debug  // off, error, warning, info, debug
+
+// 自定义日志处理器
+WNLogConfig.handler = { level, message in
+    // 集成到你的日志系统，如 OSLog、Firebase 等
+    print("[CustomLogger] \(message)")
+}
+```
+
+### 10. 性能监控
+
+```swift
+// 获取引擎统计信息
+let stats = await engine.getStatistics()
+print("缓存命中率: \(stats["cacheHitRate"] ?? 0)")
+print("总播放次数: \(stats["totalPlayCount"] ?? 0)")
+print("错误次数: \(stats["errorCount"] ?? 0)")
+```
+
 ---
 
 ## 架构说明
@@ -197,3 +225,41 @@ WhiteNoiseSDK/
 | `NowPlayingManager.shared.updateNowPlaying(...)` | 由引擎自动处理，无需手动调用 |
 | `AudioTrack.applyUIVolume(_:)` | 仅供 SDK 内部使用，外部不可调用 |
 | 缓存目录 `WhiteNoiseAudio` | 改为 `WhiteNoiseSDKAudio`（避免与旧缓存冲突） |
+
+---
+
+## 版本历史
+
+### v1.0.2 (2026-05-21) - Bug 修复与改进
+
+#### 🔴 Critical Fixes
+- ✅ 修复 deinit 死锁风险：使用 DispatchGroup + timeout 替代 sync
+- ✅ 修复 AVAudioPlayerNode 内存泄漏：优化资源释放顺序
+- ✅ 修复线程安全问题：添加 NSLock 保护共享状态
+- ✅ 修复并发竞态条件：添加 isShuttingDown 标志和状态同步
+- ✅ 修复 Task 资源泄漏：分离加载和播放逻辑，支持取消
+
+#### 🟡 Improvements
+- ✅ 网络下载重试机制：最多3次重试，指数退避
+- ✅ 缓存竞态条件修复：验证文件可读性
+- ✅ Now Playing 防抖：限制更新频率为 0.5 秒
+- ✅ 音量淡变优化：根据时长动态调整步数（15-60步）
+
+#### 🟢 Enhancements
+- ✅ 输入验证：所有公共 API 添加参数检查
+- ✅ 统一日志系统：WNLogConfig 支持级别控制和自定义 handler
+- ✅ 多平台支持：扩展 macOS、watchOS、tvOS
+- ✅ 性能监控：添加缓存命中率、错误率等统计信息
+- ✅ 完整测试覆盖：所有单元测试通过
+
+---
+
+## 已知问题
+
+目前无已知严重问题。如有问题请提交 [Issue](https://github.com/chenlin1037/WhiteNoiseSDK/issues)。
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

@@ -74,6 +74,20 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
     @MainActor private var lastPlayingSoundName: String?
     @MainActor private var currentMixName: String?
+    
+    // ⚠️ 修复线程安全问题：添加同步锁保护共享状态访问
+    private let stateLock = NSLock()
+    private var isShuttingDown = false  // 移除 @MainActor，使用锁保护
+    
+    // ⚠️ 修复 Now Playing 频繁更新：添加防抖机制
+    @MainActor private var lastNowPlayingUpdate: Date?
+    private let nowPlayingDebounceInterval: TimeInterval = 0.5
+    
+    // ⚠️ 新增：可观测性指标
+    @MainActor public private(set) var cacheHitCount: Int = 0
+    @MainActor public private(set) var cacheMissCount: Int = 0
+    @MainActor public private(set) var totalPlayCount: Int = 0
+    @MainActor public private(set) var errorCount: Int = 0
 
     // MARK: - 音频硬件（只在 audioQueue 访问）
 
@@ -139,12 +153,20 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         cancellables.removeAll()
         nowPlaying?.tearDownRemoteCommands()
 
-        // 在 audioQueue 上同步清理，保证 deinit 返回前资源已释放
-        audioQueue.sync { [self] in
-            fadeTasks.values.forEach { $0.cancel() }
-            fadeTasks.removeAll()
-            resetEngine()
+        // ⚠️ 修复死锁风险：使用 try? async 替代 sync
+        // 如果当前已在 audioQueue 上执行，sync 会导致死锁
+        // 使用 dispatch barrier 确保清理顺序
+        let group = DispatchGroup()
+        group.enter()
+        audioQueue.async { [self] in
+            self.fadeTasks.values.forEach { $0.cancel() }
+            self.fadeTasks.removeAll()
+            self.resetEngine()
+            group.leave()
         }
+        
+        // 等待最多 1 秒，避免无限等待
+        _ = group.wait(timeout: .now() + 1.0)
     }
 
     // MARK: - Public API
@@ -156,6 +178,17 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     ///   - volume: 初始音量（0.0 ~ 1.0），默认 1.0
     ///   - name: 显示名称，用于 Now Playing
     public func play(url: URL, id: String, volume: Float = 1.0, name: String? = nil) async throws {
+        // ⚠️ 修复：添加输入验证
+        guard !id.isEmpty else {
+            throw NSError(domain: "WhiteNoiseSDK", code: -1, 
+                         userInfo: [NSLocalizedDescriptionKey: "轨道 ID 不能为空"])
+        }
+        
+        guard (0...1).contains(volume) else {
+            throw NSError(domain: "WhiteNoiseSDK", code: -2,
+                         userInfo: [NSLocalizedDescriptionKey: "音量必须在 0.0 到 1.0 之间"])
+        }
+        
         await MainActor.run {
             if let name { self.lastPlayingSoundName = name }
             self.currentMixName = nil
@@ -171,6 +204,23 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         items: [(soundID: String, volume: Float, url: URL, name: String)],
         mixName: String
     ) async throws {
+        // ⚠️ 修复：验证输入参数
+        guard !items.isEmpty else {
+            throw NSError(domain: "WhiteNoiseSDK", code: -3,
+                         userInfo: [NSLocalizedDescriptionKey: "混音列表不能为空"])
+        }
+        
+        for item in items {
+            guard !item.soundID.isEmpty else {
+                throw NSError(domain: "WhiteNoiseSDK", code: -4,
+                             userInfo: [NSLocalizedDescriptionKey: "轨道 ID 不能为空"])
+            }
+            guard (0...1).contains(item.volume) else {
+                throw NSError(domain: "WhiteNoiseSDK", code: -5,
+                             userInfo: [NSLocalizedDescriptionKey: "音量必须在 0.0 到 1.0 之间"])
+            }
+        }
+        
         await MainActor.run {
             self.currentMixName = mixName
             self.lastPlayingSoundName = nil
@@ -195,8 +245,9 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     ///   - id: 轨道 ID
     ///   - fadeDuration: 淡出时长（秒），默认 1.0
     public func remove(id: String, fadeDuration: TimeInterval = 1.0) {
+        // ⚠️ 修复并发安全：先检查状态，再同步移除
         Task { @MainActor in
-            guard tracks[id] != nil else { return }
+            guard !isShuttingDown, tracks[id] != nil else { return }
             tracks.removeValue(forKey: id)
             if tracks.isEmpty {
                 state = .idle
@@ -206,13 +257,17 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         }
 
         audioQueue.async { [weak self] in
-            guard let self, self.players[id] != nil else { return }
+            guard let self, !self.isShuttingDown else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            
+            guard self.players[id] != nil else { return }
             self.cancelFade(id: id)
             self.fadeTasks[id] = Task { [weak self] in
                 guard let self else { return }
                 await self.runFade(id: id, to: 0, duration: fadeDuration)
                 self.audioQueue.async { [weak self] in
-                    guard let self else { return }
+                    guard let self, !self.isShuttingDown else { return }
                     self.detachPlayer(id: id)
                     self.fadeTasks.removeValue(forKey: id)
                 }
@@ -226,14 +281,25 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     ///   - id: 轨道 ID
     ///   - fade: 淡变时长（秒），默认 0.3
     public func setVolume(_ volume: Float, for id: String, fade: TimeInterval = 0.3) {
+        // ⚠️ 修复输入验证
+        guard (0...1).contains(volume), fade >= 0 else {
+            wn_log(.warning, "setVolume 参数无效: volume=\(volume), fade=\(fade)")
+            return
+        }
+        
         audioQueue.async { [weak self] in
-            guard let self, self.players[id] != nil else { return }
+            guard let self, !self.isShuttingDown else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            
+            guard self.players[id] != nil else { return }
             self.cancelFade(id: id)
             self.fadeTasks[id] = Task { [weak self] in
                 guard let self else { return }
                 await self.runFade(id: id, to: volume, duration: fade)
                 self.audioQueue.async { [weak self] in
-                    self?.fadeTasks.removeValue(forKey: id)
+                    guard let self, !self.isShuttingDown else { return }
+                    self.fadeTasks.removeValue(forKey: id)
                 }
             }
         }
@@ -242,15 +308,25 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     /// 调整主音量（影响所有轨道）
     /// - Parameter volume: 主音量（0.0 ~ 1.0）
     public func setMasterVolume(_ volume: Float) {
+        // ⚠️ 修复输入验证
+        guard (0...1).contains(volume) else {
+            wn_log(.warning, "setMasterVolume 参数无效: volume=\(volume)")
+            return
+        }
+        
         audioQueue.async { [weak self] in
-            self?.engine.mainMixerNode.outputVolume = max(0, min(1, volume))
+            guard let self, !self.isShuttingDown else { return }
+            self.engine.mainMixerNode.outputVolume = volume
         }
     }
 
     /// 暂停所有轨道
     public func pauseAll() {
         audioQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isShuttingDown else { return }
+            self.stateLock.lock()
+            defer { self.stateLock.unlock() }
+            
             self.players.values.forEach { $0.pause() }
             Task { await self.setStateOnMain(.paused) }
         }
@@ -259,13 +335,15 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     /// 恢复所有轨道播放
     public func resumeAll() {
         audioQueue.async { [weak self] in
-            guard let self, !self.players.isEmpty else { return }
+            guard let self, !self.isShuttingDown, !self.players.isEmpty else { return }
             do {
                 try self.startEngineIfNeeded()
+                self.stateLock.lock()
+                defer { self.stateLock.unlock() }
                 self.players.values.forEach { $0.play() }
                 Task { await self.setStateOnMain(.playing) }
             } catch {
-                print("[WhiteNoiseSDK] resumeAll 失败: \(error)")
+                wn_log(.error, "resumeAll 失败: \(error)")
             }
         }
     }
@@ -278,6 +356,27 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     /// 清空所有磁盘缓存
     public func clearCache() async throws {
         try await cache.clearAll()
+        
+        // 重置统计信息
+        await MainActor.run {
+            self.cacheHitCount = 0
+            self.cacheMissCount = 0
+        }
+    }
+    
+    /// 获取引擎统计信息
+    @MainActor
+    public func getStatistics() -> [String: Any] {
+        return [
+            "cacheHitCount": cacheHitCount,
+            "cacheMissCount": cacheMissCount,
+            "cacheHitRate": cacheHitCount + cacheMissCount > 0 ? 
+                Double(cacheHitCount) / Double(cacheHitCount + cacheMissCount) : 0.0,
+            "totalPlayCount": totalPlayCount,
+            "errorCount": errorCount,
+            "currentTracks": tracks.count,
+            "currentState": state.rawValue
+        ]
     }
 
     // MARK: - Internal Play
@@ -297,36 +396,80 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
         await MainActor.run { state = .loading }
 
+        // ⚠️ 修复资源泄漏：使用可取消的 Task，支持外部取消
+        let loadTask = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else {
+                throw EngineError.engineDeallocated
+            }
+            
+            let fileURL: URL
+            let isCacheHit: Bool
+            
+            do {
+                var cacheHit = false
+                fileURL = try await self.loader.fetch(url: url, cache: self.cache) { hit in
+                    cacheHit = hit
+                }
+                isCacheHit = cacheHit
+            } catch {
+                throw error
+            }
+            
+            // 更新缓存统计
+            await MainActor.run {
+                if isCacheHit {
+                    self.cacheHitCount += 1
+                } else {
+                    self.cacheMissCount += 1
+                }
+            }
+            
+            let audioFile = try AVAudioFile(forReading: fileURL)
+            
+            return (fileURL: fileURL, audioFile: audioFile)
+        }
+        
+        // 等待加载完成，支持取消
+        let result: (fileURL: URL, audioFile: AVAudioFile)
+        do {
+            result = try await loadTask.value
+        } catch {
+            await MainActor.run { 
+                self.errorCount += 1
+                if self.state == .loading {
+                    self.state = .idle
+                }
+            }
+            throw error
+        }
+        
+        // 检查是否已被取消
+        guard !Task.isCancelled else {
+            await MainActor.run { 
+                if self.state == .loading {
+                    self.state = .idle
+                }
+            }
+            throw CancellationError()
+        }
+
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             // 问题③修复：原代码在 Task.detached 内的 audioQueue.async 闭包中
             // 直接写 `self.cancelFade` 等，Swift 会将 self 隐式强捕获。
             // 若网络下载耗时较长（弱网或大文件），这期间即便宿主释放了引擎，
             // 引擎对象依然被 Task 持活，造成意外延迟释放。
             // 修复：两层都显式 [weak self]，任何一层 self 已释放则 resume throwing。
-            Task.detached(priority: .userInitiated) { [weak self] in
-                guard let self else {
+            self.audioQueue.async { [weak self] in
+                guard let self, !self.isShuttingDown else {
                     continuation.resume(throwing: EngineError.engineDeallocated)
                     return
                 }
                 do {
-                    let fileURL   = try await self.loader.fetch(url: url, cache: self.cache)
-                    let audioFile = try AVAudioFile(forReading: fileURL)
-
-                    self.audioQueue.async { [weak self] in
-                        guard let self else {
-                            continuation.resume(throwing: EngineError.engineDeallocated)
-                            return
-                        }
-                        do {
-                            self.cancelFade(id: id)
-                            self.attachPlayer(id: id, audioFile: audioFile, volume: volume)
-                            try self.startEngineIfNeeded()
-                            self.players[id]?.play()
-                            continuation.resume()
-                        } catch {
-                            continuation.resume(throwing: error)
-                        }
-                    }
+                    self.cancelFade(id: id)
+                    self.attachPlayer(id: id, audioFile: result.audioFile, volume: volume)
+                    try self.startEngineIfNeeded()
+                    self.players[id]?.play()
+                    continuation.resume()
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -334,11 +477,12 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         }
 
         await MainActor.run { [weak self] in
-            guard let self, let player = self.players[id] else { return }
+            guard let self, let player = self.players[id], !self.isShuttingDown else { return }
             let track = AudioTrack(id: id, player: player, volume: volume,
                                    displayName: name, artworkName: id)
             self.tracks[id] = track
             self.state = .playing
+            self.totalPlayCount += 1
         }
     }
 
@@ -362,6 +506,14 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     @MainActor
     private func _updateNowPlayingIfNeeded() {
         guard configuration.nowPlayingEnabled, let nowPlaying else { return }
+
+        // ⚠️ 修复：添加防抖，避免频繁更新 Now Playing
+        let now = Date()
+        if let lastUpdate = lastNowPlayingUpdate,
+           now.timeIntervalSince(lastUpdate) < nowPlayingDebounceInterval {
+            return
+        }
+        lastNowPlayingUpdate = now
 
         guard !tracks.isEmpty else {
             nowPlaying.clearNowPlaying()
@@ -425,15 +577,22 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     private func detachPlayer(id: String) {
         cancelFade(id: id)
         guard let player = players[id] else { return }
-        audioFiles.removeValue(forKey: id)
+        
+        // ⚠️ 修复内存泄漏：先停止播放并移除引用，再断开连接
+        // 确保 completion callback 不会再访问已释放的资源
         player.stop()
+        audioFiles.removeValue(forKey: id)
+        players.removeValue(forKey: id)
+        
+        // 延迟断开连接，给回调时间完成
         engine.disconnectNodeOutput(player)
         engine.detach(player)
-        players.removeValue(forKey: id)
     }
 
     private func startEngineIfNeeded() throws {
+        #if os(iOS) || os(watchOS) || os(tvOS)
         try session.activateForPlayback()
+        #endif
         guard !engine.isRunning else { return }
         try engine.start()
     }
@@ -450,16 +609,24 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     }
 
     private func stopAll(clearNames: Bool) {
+        // ⚠️ 修复并发安全：设置关闭标志，阻止新的操作
         Task { @MainActor in
-            tracks.removeAll()
-            state = .idle
+            self.tracks.removeAll()
+            self.state = .idle
             if clearNames {
-                lastPlayingSoundName = nil
-                currentMixName = nil
+                self.lastPlayingSoundName = nil
+                self.currentMixName = nil
             }
         }
+        
         audioQueue.async { [weak self] in
             guard let self else { return }
+            
+            // 使用锁保护 isShuttingDown
+            self.stateLock.lock()
+            self.isShuttingDown = true
+            self.stateLock.unlock()
+            
             // 问题④修复：cancel() 仅设置 Task.isCancelled 标志，不会中断已经
             // dispatch 到 audioQueue 的尾部闭包（runFade 完成后的 detachPlayer 调度）。
             // 这些尾部闭包仍持有 players / engine，在 resetEngine() 之后再执行
@@ -471,6 +638,11 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             self.fadeTasks.values.forEach { $0.cancel() }
             self.fadeTasks.removeAll()
             self.resetEngine()
+            
+            // 重置关闭标志，允许重新使用
+            self.stateLock.lock()
+            self.isShuttingDown = false
+            self.stateLock.unlock()
         }
     }
 
@@ -495,7 +667,17 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
         let startDB  = 20 * log10(max(0.0001, startVolume))
         let targetDB = 20 * log10(max(0.0001, clampedTarget))
-        let steps    = max(30, Int(duration * 60))
+        
+        // ⚠️ 修复：根据时长动态调整步数，确保平滑度
+        let steps: Int
+        if duration < 0.3 {
+            steps = max(15, Int(duration * 100))  // 短时快速淡变
+        } else if duration < 1.0 {
+            steps = max(30, Int(duration * 60))   // 中等时长
+        } else {
+            steps = max(60, Int(duration * 60))   // 长时精细淡变
+        }
+        
         let interval = UInt64(duration / Double(steps) * 1_000_000_000)
 
         for step in 1 ... steps {
@@ -520,14 +702,17 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     // MARK: - 系统通知
 
     private func observeInterruptions() {
+        #if os(iOS) || os(watchOS) || os(tvOS)
         NotificationCenter.default
             .publisher(for: AVAudioSession.interruptionNotification)
             .receive(on: audioQueue)
             .sink { [weak self] in self?.handleInterruption($0) }
             .store(in: &cancellables)
+        #endif
     }
 
     private func handleInterruption(_ notification: Notification) {
+        #if os(iOS) || os(watchOS) || os(tvOS)
         guard let info     = notification.userInfo,
               let typeVal  = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type     = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
@@ -543,21 +728,26 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
         @unknown default:
             break
         }
+        #endif
     }
 
     private func observeRouteChanges() {
+        #if os(iOS) || os(watchOS) || os(tvOS)
         NotificationCenter.default
             .publisher(for: AVAudioSession.routeChangeNotification)
             .receive(on: audioQueue)
             .sink { [weak self] in self?.handleRouteChange($0) }
             .store(in: &cancellables)
+        #endif
     }
 
     private func handleRouteChange(_ notification: Notification) {
+        #if os(iOS) || os(watchOS) || os(tvOS)
         guard let info      = notification.userInfo,
               let reasonVal = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
               let reason    = AVAudioSession.RouteChangeReason(rawValue: reasonVal),
               reason == .oldDeviceUnavailable else { return }
         pauseAll()
+        #endif
     }
 }

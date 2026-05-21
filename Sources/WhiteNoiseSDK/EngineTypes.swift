@@ -6,7 +6,7 @@ import Foundation
 // MARK: - EngineState
 
 /// 引擎播放状态
-public enum EngineState: Equatable {
+public enum EngineState: Equatable, RawRepresentable {
     /// 无轨道，引擎空闲
     case idle
     /// 正在加载音频文件
@@ -15,6 +15,25 @@ public enum EngineState: Equatable {
     case playing
     /// 已暂停
     case paused
+    
+    public var rawValue: String {
+        switch self {
+        case .idle: return "idle"
+        case .loading: return "loading"
+        case .playing: return "playing"
+        case .paused: return "paused"
+        }
+    }
+    
+    public init?(rawValue: String) {
+        switch rawValue {
+        case "idle": self = .idle
+        case "loading": self = .loading
+        case "playing": self = .playing
+        case "paused": self = .paused
+        default: return nil
+        }
+    }
 }
 
 // MARK: - EngineError

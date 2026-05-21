@@ -5,6 +5,7 @@
 
 import XCTest
 @testable import WhiteNoiseSDK
+import AVFoundation
 
 final class WhiteNoiseSDKTests: XCTestCase {
 

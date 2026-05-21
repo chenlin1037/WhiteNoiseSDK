@@ -24,6 +24,13 @@ actor AudioCache {
     func localURL(for remoteURL: URL) -> URL? {
         let dest = destinationURL(for: remoteURL)
         guard FileManager.default.fileExists(atPath: dest.path) else { return nil }
+        
+        // ⚠️ 修复竞态条件：验证文件可读性后再返回
+        guard FileManager.default.isReadableFile(atPath: dest.path) else {
+            // 文件存在但不可读，可能是正在写入或删除中
+            return nil
+        }
+        
         touchModificationDate(dest)
         return dest
     }

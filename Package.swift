@@ -5,6 +5,9 @@ let package = Package(
     name: "WhiteNoiseSDK",
     platforms: [
         .iOS(.v16),
+        .macOS(.v13),
+        .watchOS(.v9),
+        .tvOS(.v16),
     ],
     products: [
         .library(
