@@ -109,19 +109,26 @@ final class NowPlayingManager {
     }
 
     func updatePlaybackState(isPlaying: Bool) {
-        // ⚠️ 修复：立即同步更新播放状态
-        // 确保应用内、锁屏和控制中心三者状态完全一致
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            
-            // 直接更新 playbackState
-            self.nowPlayingInfoCenter.playbackState = isPlaying ? .playing : .paused
-            
-            // 同时更新 playbackRate，这对锁屏控制很重要
-            if var info = self.nowPlayingInfoCenter.nowPlayingInfo {
-                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-                self.nowPlayingInfoCenter.nowPlayingInfo = info
+        // ⚠️ 修复：必须在主线程同步更新，确保原子性
+        // 如果当前已经在主线程，直接执行；否则同步派发到主线程
+        if Thread.isMainThread {
+            _applyPlaybackStateUpdate(isPlaying: isPlaying)
+        } else {
+            DispatchQueue.main.sync { [weak self] in
+                self?._applyPlaybackStateUpdate(isPlaying: isPlaying)
             }
+        }
+    }
+    
+    /// 内部方法：应用播放状态更新（必须在主线程调用）
+    private func _applyPlaybackStateUpdate(isPlaying: Bool) {
+        // 直接更新 playbackState
+        nowPlayingInfoCenter.playbackState = isPlaying ? .playing : .paused
+        
+        // 同时更新 playbackRate，这对控制中心图标至关重要
+        if var info = nowPlayingInfoCenter.nowPlayingInfo {
+            info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+            nowPlayingInfoCenter.nowPlayingInfo = info
         }
     }
 
