@@ -123,14 +123,21 @@ final class NowPlayingManager {
     }
 
     func updatePlaybackState(isPlaying: Bool) {
-        DispatchQueue.main.async { [weak self] in
+        let update = { [weak self] in
             guard let self else { return }
             self.updateRevision += 1
-            guard var info = self.nowPlayingInfoCenter.nowPlayingInfo else { return }
-            info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-            self.nowPlayingInfoCenter.nowPlayingInfo = info
+            if var info = self.nowPlayingInfoCenter.nowPlayingInfo {
+                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+                self.nowPlayingInfoCenter.nowPlayingInfo = info
+            }
             self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
             self.updateCommandAvailability(hasActiveItem: true)
+        }
+
+        if Thread.isMainThread {
+            update()
+        } else {
+            DispatchQueue.main.async(execute: update)
         }
     }
 

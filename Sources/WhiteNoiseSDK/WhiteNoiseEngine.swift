@@ -261,23 +261,32 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
     /// 暂停所有轨道
     public func pauseAll() {
+        Task { @MainActor [weak self] in
+            guard let self, !self.trackSnapshots.isEmpty else { return }
+            self.state = .paused
+        }
+
         audioQueue.async { [weak self] in
             guard let self else { return }
             self.players.values.forEach { $0.pause() }
-            Task { await self.setStateOnMain(.paused) }
         }
     }
 
     /// 恢复所有轨道播放
     public func resumeAll() {
+        Task { @MainActor [weak self] in
+            guard let self, !self.trackSnapshots.isEmpty else { return }
+            self.state = .playing
+        }
+
         audioQueue.async { [weak self] in
             guard let self, !self.players.isEmpty else { return }
             do {
                 try self.startEngineIfNeeded()
                 self.players.values.forEach { $0.play() }
-                Task { await self.setStateOnMain(.playing) }
             } catch {
                 print("[WhiteNoiseSDK] resumeAll 失败: \(error)")
+                Task { await self.setStateOnMain(.paused) }
             }
         }
     }
