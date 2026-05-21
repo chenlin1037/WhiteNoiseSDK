@@ -59,12 +59,29 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
 
     /// 当前所有播放轨道，key 为轨道 ID
     @MainActor @Published public private(set) var tracks: [String: AudioTrack] = [:] {
-        didSet { _updateNowPlayingIfNeeded() }
+        didSet {
+            // ⚠️ 修复：轨道变化时使用防抖更新完整信息（标题、封面等）
+            _scheduleFullNowPlayingUpdate()
+        }
     }
 
     /// 引擎当前状态
     @MainActor @Published public private(set) var state: EngineState = .idle {
-        didSet { _updateNowPlayingIfNeeded() }
+        didSet {
+            // ⚠️ 修复：状态变化时立即同步到 Now Playing，不使用防抖
+            if configuration.nowPlayingEnabled, let nowPlaying = self.nowPlaying {
+                let isPlaying = (state == .playing)
+                nowPlaying.updatePlaybackState(isPlaying: isPlaying)
+            }
+            
+            // 同时更新所有轨道的播放状态
+            for track in tracks.values {
+                track.updatePlaybackState(state == .playing)
+            }
+            
+            // 延迟更新完整的 Now Playing 信息（标题、封面等）
+            _scheduleFullNowPlayingUpdate()
+        }
     }
 
     /// 引擎配置（只读）
@@ -82,6 +99,9 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     // ⚠️ 修复 Now Playing 频繁更新：添加防抖机制
     @MainActor private var lastNowPlayingUpdate: Date?
     private let nowPlayingDebounceInterval: TimeInterval = 0.5
+    
+    // ⚠️ 新增：防抖任务引用，用于取消待处理的完整更新
+    @MainActor private var fullNowPlayingUpdateTask: Task<Void, Never>?
     
     // ⚠️ 新增：可观测性指标
     @MainActor public private(set) var cacheHitCount: Int = 0
@@ -330,15 +350,10 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             // ⚠️ 修复：先更新所有 player 的暂停状态
             self.players.values.forEach { $0.pause() }
             
-            // ⚠️ 关键修复：立即在主线程更新状态和 Now Playing
+            // ⚠️ 关键修复：在主线程更新状态，触发 didSet 立即同步到 Now Playing
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.state = .paused
-                
-                // 立即更新 Now Playing 的播放状态
-                if self.configuration.nowPlayingEnabled, let nowPlaying = self.nowPlaying {
-                    nowPlaying.updatePlaybackState(isPlaying: false)
-                }
             }
         }
     }
@@ -355,15 +370,10 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
                 // ⚠️ 修复：先更新所有 player 的播放状态
                 self.players.values.forEach { $0.play() }
                 
-                // ⚠️ 关键修复：立即在主线程更新状态和 Now Playing
+                // ⚠️ 关键修复：在主线程更新状态，触发 didSet 立即同步到 Now Playing
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.state = .playing
-                    
-                    // 立即更新 Now Playing 的播放状态
-                    if self.configuration.nowPlayingEnabled, let nowPlaying = self.nowPlaying {
-                        nowPlaying.updatePlaybackState(isPlaying: true)
-                    }
                 }
             } catch {
                 wn_log(.error, "resumeAll 失败: \(error)")
@@ -530,7 +540,7 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
     private func _updateNowPlayingIfNeeded() {
         guard configuration.nowPlayingEnabled, let nowPlaying else { return }
 
-        // ⚠️ 修复：添加防抖，避免频繁更新 Now Playing
+        // ⚠️ 修复：添加防抖，避免频繁更新 Now Playing 的完整信息（标题、封面等）
         let now = Date()
         if let lastUpdate = lastNowPlayingUpdate,
            now.timeIntervalSince(lastUpdate) < nowPlayingDebounceInterval {
@@ -561,6 +571,17 @@ public final class WhiteNoiseEngine: ObservableObject, @unchecked Sendable {
             .first
 
         nowPlaying.updateNowPlaying(title: title, isPlaying: state == .playing, artworkName: artworkName)
+    }
+    
+    /// ⚠️ 新增：调度完整的 Now Playing 更新（带防抖），用于标题、封面等信息变化
+    @MainActor
+    private func _scheduleFullNowPlayingUpdate() {
+        fullNowPlayingUpdateTask?.cancel()
+        fullNowPlayingUpdateTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(self?.nowPlayingDebounceInterval ?? 0.5 * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?._updateNowPlayingIfNeeded()
+        }
     }
 
     // MARK: - 音频硬件私有方法（只在 audioQueue 调用）
