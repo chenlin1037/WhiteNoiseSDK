@@ -2,244 +2,119 @@
 //  NowPlayingManager.swift
 //  WhiteNoiseSDK
 //
-//  internal —— 宿主项目不直接使用，通过 WhiteNoiseEngine.Configuration 控制行为
-//
 
 import AVFoundation
+import Foundation
 import MediaPlayer
-
-#if canImport(UIKit)
 import UIKit
-#endif
 
-final class NowPlayingManager {
+public final class NowPlayingManager {
+    public static let shared = NowPlayingManager()
 
     private let nowPlayingInfoCenter = MPNowPlayingInfoCenter.default()
-    private let remoteCommandCenter  = MPRemoteCommandCenter.shared()
-    private let artistName: String
-    private let updateQueue = DispatchQueue(
-        label: "com.whitenoiseSDK.nowPlayingQueue",
-        qos: .utility
-    )
-    private var updateRevision = 0
+    private let remoteCommandCenter = MPRemoteCommandCenter.shared()
 
-    init(artistName: String) {
-        self.artistName = artistName
-    }
-
-    // MARK: - Remote Commands
-
-    // MARK: - Remote Commands
-    //
-    // 问题①修复：MPRemoteCommandCenter 是进程级系统单例，它持有所有通过
-    // addTarget(_:action:) 注册的闭包，生命周期与进程相同。
-    // 若闭包直接捕获 playHandler/pauseHandler（它们本身又通过 [weak self] 持有引擎），
-    // 则原始闭包链在 removeTarget 被调用前永远不会释放。
-    //
-    // 解决方案：将三个处理器存为弱包装的 token，并在 deinit 里显式 removeTarget。
-    // 同时将 handler 参数改为 weak-wrapper closure，确保引擎可以正常回收。
-
-    private var playToken:   Any?
-    private var pauseToken:  Any?
+    private var playToken: Any?
+    private var pauseToken: Any?
     private var toggleToken: Any?
 
-    func setupRemoteCommands(
-        playHandler:   @escaping () -> Void,
-        pauseHandler:  @escaping () -> Void,
+    private let artworkCache = NSCache<NSString, UIImage>()
+
+    private init() {}
+
+    // MARK: - Remote Commands
+
+    public func setupRemoteCommands(
+        playHandler: @escaping () -> Void,
+        pauseHandler: @escaping () -> Void,
         toggleHandler: @escaping () -> Void
     ) {
-        // 先移除旧 target，防止重复注册
         tearDownRemoteCommands()
-
-        remoteCommandCenter.nextTrackCommand.isEnabled              = false
-        remoteCommandCenter.previousTrackCommand.isEnabled          = false
+        remoteCommandCenter.nextTrackCommand.isEnabled = false
+        remoteCommandCenter.previousTrackCommand.isEnabled = false
         remoteCommandCenter.changePlaybackPositionCommand.isEnabled = false
-        remoteCommandCenter.stopCommand.isEnabled                   = false
-
-#if canImport(UIKit)
+        remoteCommandCenter.stopCommand.isEnabled = false
         UIApplication.shared.beginReceivingRemoteControlEvents()
-#endif
-
         remoteCommandCenter.playCommand.isEnabled = true
-        playToken = remoteCommandCenter.playCommand.addTarget { _ in
-            playHandler()
-            return .success
-        }
-
+        playToken = remoteCommandCenter.playCommand.addTarget { _ in playHandler(); return .success }
         remoteCommandCenter.pauseCommand.isEnabled = true
-        pauseToken = remoteCommandCenter.pauseCommand.addTarget { _ in
-            pauseHandler()
-            return .success
-        }
-
+        pauseToken = remoteCommandCenter.pauseCommand.addTarget { _ in pauseHandler(); return .success }
         remoteCommandCenter.togglePlayPauseCommand.isEnabled = true
-        toggleToken = remoteCommandCenter.togglePlayPauseCommand.addTarget { _ in
-            toggleHandler()
-            return .success
-        }
-
-        updateCommandAvailability(hasActiveItem: false)
+        toggleToken = remoteCommandCenter.togglePlayPauseCommand.addTarget { _ in toggleHandler(); return .success }
     }
 
-    /// 在引擎 deinit 时调用，从系统单例中移除所有 target，切断强引用链
-    func tearDownRemoteCommands() {
-        if let t = playToken   { remoteCommandCenter.playCommand.removeTarget(t);              playToken   = nil }
-        if let t = pauseToken  { remoteCommandCenter.pauseCommand.removeTarget(t);             pauseToken  = nil }
-        if let t = toggleToken { remoteCommandCenter.togglePlayPauseCommand.removeTarget(t);   toggleToken = nil }
+    public func tearDownRemoteCommands() {
+        if let t = playToken { remoteCommandCenter.playCommand.removeTarget(t); playToken = nil }
+        if let t = pauseToken { remoteCommandCenter.pauseCommand.removeTarget(t); pauseToken = nil }
+        if let t = toggleToken { remoteCommandCenter.togglePlayPauseCommand.removeTarget(t); toggleToken = nil }
     }
 
     // MARK: - Now Playing Info
 
-    func updateNowPlaying(title: String, isPlaying: Bool, artworkName: String? = nil) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let revision = self.nextUpdateRevision()
-
-            self.updateQueue.async { [weak self] in
-                guard let self else { return }
-                var info = [String: Any]()
-                info[MPMediaItemPropertyTitle]                    = title
-                info[MPMediaItemPropertyArtist]                   = artistName
-                info[MPNowPlayingInfoPropertyIsLiveStream]        = true
-                info[MPNowPlayingInfoPropertyMediaType]           = MPNowPlayingInfoMediaType.audio.rawValue
-                info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
-                info[MPNowPlayingInfoPropertyPlaybackRate]        = isPlaying ? 1.0 : 0.0
-
-                if let image = artworkImage(named: artworkName) {
-#if canImport(UIKit)
-                    let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                    info[MPMediaItemPropertyArtwork] = artwork
-#endif
-                }
-
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, revision == self.updateRevision else { return }
-                    self.nowPlayingInfoCenter.nowPlayingInfo = info
-                    self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
-                    self.updateCommandAvailability(hasActiveItem: true)
-                }
-            }
+    public func updateNowPlaying(
+        title: String,
+        artist: String = "WhiteNoiseSDK",
+        isPlaying: Bool,
+        artworkName: String? = nil
+    ) {
+        var info = [String: Any]()
+        info[MPMediaItemPropertyTitle] = title
+        info[MPMediaItemPropertyArtist] = artist
+        info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = 0.0
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
+        if let image = artworkImage(named: artworkName) {
+            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
         }
+        nowPlayingInfoCenter.nowPlayingInfo = info
     }
 
-    func updatePlaybackState(isPlaying: Bool) {
-        let update = { [weak self] in
-            guard let self else { return }
-            self.updateRevision += 1
-            if var info = self.nowPlayingInfoCenter.nowPlayingInfo {
-                info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-                self.nowPlayingInfoCenter.nowPlayingInfo = info
-            }
-            self.nowPlayingInfoCenter.playbackState  = isPlaying ? .playing : .paused
-            self.updateCommandAvailability(hasActiveItem: true)
-        }
-
-        if Thread.isMainThread {
-            update()
-        } else {
-            DispatchQueue.main.async(execute: update)
-        }
+    public func clearNowPlaying() {
+        nowPlayingInfoCenter.nowPlayingInfo = nil
     }
 
-    func clearNowPlaying() {
-        DispatchQueue.main.async { [weak self] in
-            self?.updateRevision += 1
-            self?.nowPlayingInfoCenter.nowPlayingInfo = nil
-            self?.nowPlayingInfoCenter.playbackState  = .stopped
-            self?.updateCommandAvailability(hasActiveItem: false)
-        }
-    }
-
-    private func nextUpdateRevision() -> Int {
-        updateRevision += 1
-        return updateRevision
-    }
-
-    private func updateCommandAvailability(hasActiveItem: Bool) {
-        let update = { [weak self] in
-            guard let self else { return }
-            self.remoteCommandCenter.playCommand.isEnabled = hasActiveItem
-            self.remoteCommandCenter.pauseCommand.isEnabled = hasActiveItem
-            self.remoteCommandCenter.togglePlayPauseCommand.isEnabled = hasActiveItem
-        }
-
-        if Thread.isMainThread {
-            update()
-        } else {
-            DispatchQueue.main.async(execute: update)
-        }
-    }
-
-    // MARK: - Artwork Generation
-
-#if canImport(UIKit)
-    // 问题⑤修复：原代码每次调用 updateNowPlaying 都重新绘制一张 512×512 UIImage。
-    // 封面图片与 artworkName 绑定，内容不变，无需重复渲染。
-    // 使用 NSCache（而非 Dictionary）存储：系统内存压力大时自动驱逐，
-    // 且 NSCache 是线程安全的，无需额外锁。
-    private let artworkCache = NSCache<NSString, UIImage>()
+    // MARK: - Artwork
 
     private func artworkImage(named name: String?) -> UIImage? {
         let cacheKey = (name ?? "__default__") as NSString
         if let cached = artworkCache.object(forKey: cacheKey) { return cached }
-
-        let icon   = name.flatMap { UIImage(named: $0) }
+        let icon = name.flatMap { UIImage(named: $0) }
         let format = UIGraphicsImageRendererFormat()
         format.scale = UIScreen.main.scale
-        let renderer = UIGraphicsImageRenderer(
-            size: CGSize(width: 512, height: 512), format: format
-        )
-
-        let image = renderer.image { context in
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 512, height: 512), format: format)
+        let image = renderer.image { ctx in
             let rect = CGRect(x: 0, y: 0, width: 512, height: 512)
-            drawArtworkBackground(in: rect, context: context.cgContext)
-
+            drawArtworkBackground(in: rect, context: ctx.cgContext)
             if let icon {
-                let tinted = icon.withTintColor(.white, renderingMode: .alwaysOriginal)
-                tinted.draw(
-                    in: CGRect(x: 128, y: 128, width: 256, height: 256),
-                    blendMode: .normal, alpha: 0.96
-                )
+                icon.withTintColor(.white, renderingMode: .alwaysOriginal)
+                    .draw(in: CGRect(x: 128, y: 128, width: 256, height: 256), blendMode: .normal, alpha: 0.96)
             } else {
-                let style = NSMutableParagraphStyle()
-                style.alignment = .center
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font:            UIFont.systemFont(ofSize: 172, weight: .semibold),
-                    .foregroundColor: UIColor.white,
-                    .paragraphStyle:  style
-                ]
+                let para = NSMutableParagraphStyle(); para.alignment = .center
                 NSString(string: "WN").draw(
                     in: CGRect(x: 0, y: 156, width: 512, height: 220),
-                    withAttributes: attrs
+                    withAttributes: [
+                        .font: UIFont.systemFont(ofSize: 172, weight: .semibold),
+                        .foregroundColor: UIColor.white,
+                        .paragraphStyle: para,
+                    ]
                 )
             }
         }
-
         artworkCache.setObject(image, forKey: cacheKey)
         return image
     }
 
     private func drawArtworkBackground(in rect: CGRect, context: CGContext) {
-        let colors: CFArray = [
+        let colors = [
             UIColor(red: 0.13, green: 0.20, blue: 0.23, alpha: 1).cgColor,
             UIColor(red: 0.22, green: 0.48, blue: 0.50, alpha: 1).cgColor,
         ] as CFArray
         let locations: [CGFloat] = [0, 1]
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-
-        if let gradient = CGGradient(
-            colorsSpace: colorSpace, colors: colors, locations: locations
-        ) {
-            context.drawLinearGradient(
-                gradient,
+        if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: locations) {
+            context.drawLinearGradient(gradient,
                 start: CGPoint(x: rect.minX, y: rect.minY),
-                end:   CGPoint(x: rect.maxX, y: rect.maxY),
-                options: []
-            )
+                end: CGPoint(x: rect.maxX, y: rect.maxY), options: [])
         }
     }
-#else
-    // macOS / visionOS：不生成 UIImage，返回 nil 跳过封面设置
-    private func artworkImage(named _: String?) -> Never? { nil }
-#endif
 }
